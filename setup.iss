@@ -7,7 +7,7 @@
 
 #define AppName "Mail Merge"
 #define AppVersion "1.0.0"
-#define AppPublisher "La Tua Azienda"
+#define AppPublisher "SALVOTROTTA.COM"
 #define AppExeName "avvia.bat"
 
 [Setup]
