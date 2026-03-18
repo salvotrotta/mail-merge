@@ -40,7 +40,7 @@ Applicazione Windows per generare documenti personalizzati in serie a partire da
 ### Metodo 2 — Da sorgente
 
 ```bash
-git clone https://github.com/TUO-USERNAME/mail-merge.git
+git clone https://github.com/salvotrotta/mail-merge.git
 cd mail-merge
 pip install -r requirements.txt
 python mail_merge_gui.py
