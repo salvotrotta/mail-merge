@@ -7,7 +7,8 @@ Librerie installate automaticamente: python-docx, openpyxl
 Avvio: python mail_merge_gui.py
 """
 
-import subprocess, sys, os, re, shutil, threading
+import subprocess, sys, os, re, shutil, threading, multiprocessing
+multiprocessing.freeze_support()  # richiesto da PyInstaller su Windows
 
 # ── Log errori a file (utile quando compilato con PyInstaller) ───────────────
 import traceback
@@ -27,11 +28,14 @@ def _log_crash(exc_type, exc_value, exc_tb):
 
 sys.excepthook = _log_crash
 
-for pkg in ["python-docx", "openpyxl", "pikepdf"]:
-    try:
-        __import__(pkg.replace("-", "_").split(".")[0])
-    except ImportError:
-        subprocess.check_call([sys.executable, "-m", "pip", "install", pkg, "-q"])
+# Quando impacchettato con PyInstaller sys.frozen=True e i pacchetti
+# sono già inclusi nel bundle — l'auto-install va saltato.
+if not getattr(sys, "frozen", False):
+    for pkg in ["python-docx", "openpyxl", "pikepdf"]:
+        try:
+            __import__(pkg.replace("-", "_").split(".")[0])
+        except ImportError:
+            subprocess.check_call([sys.executable, "-m", "pip", "install", pkg, "-q"])
 
 import openpyxl
 from docx import Document
@@ -132,11 +136,16 @@ def _applica_pdfa(pdf_path):
     os.replace(tmp, pdf_path)
 
 def converti(docx_path, output_dir, soffice, fmt):
+    env = os.environ.copy()
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+        meipass = sys._MEIPASS
+        paths = env.get("PATH", "").split(os.pathsep)
+        env["PATH"] = os.pathsep.join(p for p in paths if meipass not in p)
     subprocess.run(
         [soffice, "--headless", "--norestore", "--nologo",
          "--convert-to", "pdf", "--outdir", output_dir, docx_path],
         check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        timeout=300,
+        timeout=300, env=env,
     )
     if fmt == "pdfa":
         base     = os.path.splitext(os.path.basename(docx_path))[0]
