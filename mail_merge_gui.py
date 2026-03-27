@@ -27,7 +27,7 @@ def _log_crash(exc_type, exc_value, exc_tb):
 
 sys.excepthook = _log_crash
 
-for pkg in ["python-docx", "openpyxl"]:
+for pkg in ["python-docx", "openpyxl", "pikepdf"]:
     try:
         __import__(pkg.replace("-", "_").split(".")[0])
     except ImportError:
@@ -98,10 +98,50 @@ def processa_documento(template_path, riga, colonne_valuta=None):
             for para in sez.first_page_footer.paragraphs: sostituisci_paragrafo(para, riga, colonne_valuta)
     return doc
 
+# Profilo ICC sRGB di Windows — usato per OutputIntents PDF/A
+_SRGB_ICC = r"C:\Windows\System32\spool\drivers\color\sRGB Color Space Profile.icm"
+
+def _applica_pdfa(pdf_path):
+    """Aggiunge i marcatori PDF/A-2b (XMP + OutputIntents) a un PDF esistente."""
+    import pikepdf
+    from pikepdf import Dictionary, Array, Name
+
+    tmp = pdf_path + ".pdfa_tmp"
+    with pikepdf.open(pdf_path) as pdf:
+        with pdf.open_metadata() as meta:
+            meta["pdfaid:part"]        = "2"
+            meta["pdfaid:conformance"] = "B"
+
+        if os.path.exists(_SRGB_ICC):
+            with open(_SRGB_ICC, "rb") as f:
+                icc_data = f.read()
+            icc_stream = pdf.make_stream(icc_data)
+            icc_stream["/N"]         = pikepdf.Object.parse(b"3")
+            icc_stream["/Alternate"] = Name("/DeviceRGB")
+            icc_ref = pdf.make_indirect(icc_stream)
+            output_intent = Dictionary(
+                Type=Name("/OutputIntent"),
+                S=Name("/GTS_PDFA1"),
+                OutputConditionIdentifier=pikepdf.String("sRGB"),
+                DestOutputProfile=icc_ref,
+            )
+            if "/OutputIntents" not in pdf.Root:
+                pdf.Root["/OutputIntents"] = Array([output_intent])
+
+        pdf.save(tmp)
+    os.replace(tmp, pdf_path)
+
 def converti(docx_path, output_dir, soffice, fmt):
-    filtro = "pdf:writer_pdf_Export:EmbedStandardFonts=true,SelectPdfVersion=1" if fmt == "pdfa" else "pdf"
-    subprocess.run([soffice, "--headless", "--convert-to", filtro, "--outdir", output_dir, docx_path],
-                   check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    subprocess.run(
+        [soffice, "--headless", "--norestore", "--nologo",
+         "--convert-to", "pdf", "--outdir", output_dir, docx_path],
+        check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        timeout=300,
+    )
+    if fmt == "pdfa":
+        base     = os.path.splitext(os.path.basename(docx_path))[0]
+        pdf_path = os.path.join(output_dir, base + ".pdf")
+        _applica_pdfa(pdf_path)
 
 # ── Finestra selezione record ─────────────────────────────────────────────────
 class DialogSelezioneRecord(tk.Toplevel):

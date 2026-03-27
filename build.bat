@@ -13,7 +13,7 @@ if errorlevel 1 (
 
 :: Installa dipendenze
 echo Installo dipendenze...
-python -m pip install pyinstaller python-docx openpyxl pillow -q
+python -m pip install pyinstaller python-docx openpyxl pillow pikepdf -q
 
 :: Verifica PyInstaller
 python -m PyInstaller --version >nul 2>&1
@@ -57,8 +57,11 @@ python -m PyInstaller ^
     --hidden-import "tkinter.ttk" ^
     --hidden-import "tkinter.filedialog" ^
     --hidden-import "tkinter.messagebox" ^
+    --hidden-import "pikepdf" ^
+    --hidden-import "pikepdf._core" ^
     --collect-all "docx" ^
     --collect-all "openpyxl" ^
+    --collect-all "pikepdf" ^
     --clean ^
     mail_merge_gui.py
 

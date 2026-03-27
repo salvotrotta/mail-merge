@@ -6,7 +6,7 @@
 ; ================================================
 
 #define AppName "Mail Merge"
-#define AppVersion "1.0.0"
+#define AppVersion "1.1.0"
 #define AppPublisher "SALVOTROTTA.COM"
 #define AppExeName "avvia.bat"
 
@@ -93,7 +93,7 @@ begin
   if CurStep = ssPostInstall then
   begin
     { Installa dipendenze }
-    Exec('python', '-m pip install python-docx openpyxl --quiet',
+    Exec('python', '-m pip install python-docx openpyxl pikepdf --quiet',
          '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
   end;
 end;
