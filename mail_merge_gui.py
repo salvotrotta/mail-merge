@@ -1,27 +1,24 @@
 """
 MAIL MERGE GUI
 ==============
-Requisiti: Python 3.8+ (Tkinter incluso), LibreOffice per PDF
+Requisiti: Python 3.8+ (Tkinter incluso), LibreOffice o Word per PDF
 Librerie installate automaticamente: python-docx, openpyxl
 
 Avvio: python mail_merge_gui.py
 """
 
-import subprocess, sys, os, re, shutil, threading
+import subprocess, sys, os, re, shutil, threading, traceback
 
-# ── Log errori a file (utile quando compilato con PyInstaller) ───────────────
-import traceback
-
+# ── Log errori a file ─────────────────────────────────────────────────────────
 def _log_crash(exc_type, exc_value, exc_tb):
     log_path = os.path.join(os.path.expanduser("~"), "MailMerge_error.log")
     with open(log_path, "a", encoding="utf-8") as f:
         import datetime
-        f.write(f"\n{'='*60}\n{datetime.datetime.now()}\n")
+        f.write("\n" + "="*60 + "\n" + str(datetime.datetime.now()) + "\n")
         traceback.print_exception(exc_type, exc_value, exc_tb, file=f)
     try:
         import tkinter.messagebox as mb
-        mb.showerror("Errore avvio",
-                     f"Si è verificato un errore.\nDettagli in:\n{log_path}")
+        mb.showerror("Errore avvio", "Si e' verificato un errore.\nDettagli in:\n" + log_path)
     except Exception:
         pass
 
@@ -50,110 +47,173 @@ ERROR   = "#DC2626"
 FONT    = "Segoe UI"
 
 # ── Logica merge ──────────────────────────────────────────────────────────────
+
 def trova_libreoffice():
     for p in [r"C:\Program Files\LibreOffice\program\soffice.exe",
               r"C:\Program Files (x86)\LibreOffice\program\soffice.exe"]:
         if os.path.exists(p): return p
     return shutil.which("soffice")
 
-def sostituisci_paragrafo(para, riga):
-    testo = "".join(r.text for r in para.runs)
-    if "{{" not in testo: return
-    testo = re.sub(r'\{\{([^}]+)\}\}', lambda m: str(riga.get(m.group(1).strip(), m.group(0))), testo)
-    if para.runs:
-        para.runs[0].text = testo
-        for r in para.runs[1:]: r.text = ""
+def normalizza_toc(doc):
+    """
+    Rimuove w:webHidden e scioglie gli hyperlink interni TOC
+    in run normali, cosi' LibreOffice li renderizza correttamente.
+    """
+    ns_w   = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    tag_p  = "{%s}p"         % ns_w
+    tag_hl = "{%s}hyperlink" % ns_w
+    tag_rp = "{%s}rPr"       % ns_w
+    tag_wh = "{%s}webHidden" % ns_w
+    tag_r  = "{%s}r"         % ns_w
+    tag_u  = "{%s}u"         % ns_w
+
+    body = doc.element.body
+
+    # 1. Rimuovi tutti w:webHidden
+    for wh in list(body.iter(tag_wh)):
+        p = wh.getparent()
+        if p is not None:
+            p.remove(wh)
+
+    # 2. Sciogli hyperlink interni (TOC anchor)
+    for para in body.iter(tag_p):
+        for hl in list(para.findall(tag_hl)):
+            anchor = hl.get("{%s}anchor" % ns_w)
+            if anchor is None:
+                continue
+            idx = list(para).index(hl)
+            for child in list(hl):
+                if child.tag == tag_r:
+                    rpr = child.find(tag_rp)
+                    if rpr is not None:
+                        for u in list(rpr.findall(tag_u)):
+                            rpr.remove(u)
+                para.insert(idx, child)
+                idx += 1
+            para.remove(hl)
+
+    return doc
 
 def sostituisci_xml_raw(elemento, riga, colonne_valuta=None):
     """
-    Sostituisce i segnaposto direttamente nell'XML dell'elemento,
-    utile per raggiungere nodi non esposti da python-docx
-    (indici, TOC, content controls, campi strutturati, ecc.)
+    Sostituisce segnaposto direttamente nell'XML,
+    paragrafo per paragrafo, gestendo segnaposto spezzati su piu' run.
     """
     colonne_valuta = colonne_valuta or set()
-    ns = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    ns_w  = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    tag_p = "{%s}p" % ns_w
+    tag_t = "{%s}t" % ns_w
 
-    # Tutti i nodi <w:t> dentro l'elemento
-    for t in elemento.iter("{%s}t" % ns):
-        if t.text and "{{" in t.text:
-            def repl(m):
-                chiave = m.group(1).strip()
-                val = riga.get(chiave, m.group(0))
-                if chiave in colonne_valuta:
-                    try:
-                        n = float(str(val).replace(",", "."))
-                        val = "€ {:.2f}".format(n).replace(",", "X").replace(".", ",").replace("X", ".")
-                    except (ValueError, TypeError):
-                        pass
-                return str(val)
-            t.text = re.sub(r'\{\{([^}]+)\}\}', repl, t.text)
-
-def sostituisci_paragrafo(para, riga, colonne_valuta=None):
-    colonne_valuta = colonne_valuta or set()
-    testo = "".join(r.text for r in para.runs)
-    if "{{" not in testo:
-        return
-    def repl(m):
-        chiave = m.group(1).strip()
-        val = riga.get(chiave, m.group(0))
+    def formatta(chiave, val):
         if chiave in colonne_valuta:
             try:
                 n = float(str(val).replace(",", "."))
-                val = "€ {:.2f}".format(n).replace(",", "X").replace(".", ",").replace("X", ".")
+                return "EUR {:.2f}".format(n).replace(",","X").replace(".",",").replace("X",".")
             except (ValueError, TypeError):
                 pass
         return str(val)
-    testo = re.sub(r'\{\{([^}]+)\}\}', repl, testo)
-    if para.runs:
-        para.runs[0].text = testo
-        for r in para.runs[1:]: r.text = ""
+
+    for para in elemento.iter(tag_p):
+        t_nodes = [t for t in para.iter(tag_t)]
+        if not t_nodes:
+            continue
+        testo = "".join(t.text or "" for t in t_nodes)
+        if "{{" not in testo:
+            continue
+        def repl(m):
+            chiave = m.group(1).strip()
+            return formatta(chiave, riga.get(chiave, m.group(0)))
+        testo_nuovo = re.sub(r'\{\{([^}]+)\}\}', repl, testo)
+        t_nodes[0].text = testo_nuovo
+        if " " in testo_nuovo:
+            t_nodes[0].set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
+        for t in t_nodes[1:]:
+            t.text = ""
+
+def sostituisci_paragrafo(para, riga, colonne_valuta=None):
+    """Mantenuta per compatibilita' — delega a sostituisci_xml_raw."""
+    pass
 
 def processa_documento(template_path, riga, colonne_valuta=None):
     colonne_valuta = colonne_valuta or set()
     doc = Document(template_path)
 
-    # 1. Paragrafi normali
-    for para in doc.paragraphs:
-        sostituisci_paragrafo(para, riga, colonne_valuta)
-
-    # 2. Tabelle
-    for tab in doc.tables:
-        for row in tab.rows:
-            for cell in row.cells:
-                for para in cell.paragraphs:
-                    sostituisci_paragrafo(para, riga, colonne_valuta)
-
-    # 3. Header e footer di ogni sezione
-    for sez in doc.sections:
-        for para in sez.header.paragraphs:
-            sostituisci_paragrafo(para, riga, colonne_valuta)
-        for para in sez.footer.paragraphs:
-            sostituisci_paragrafo(para, riga, colonne_valuta)
-        if sez.different_first_page_header_footer:
-            for para in sez.first_page_header.paragraphs:
-                sostituisci_paragrafo(para, riga, colonne_valuta)
-            for para in sez.first_page_footer.paragraphs:
-                sostituisci_paragrafo(para, riga, colonne_valuta)
-
-    # 4. Indice / TOC / Content Controls / campi strutturati
-    #    Agisce direttamente sull'XML del body per raggiungere
-    #    nodi non esposti da python-docx
+    # Corpo del documento (paragrafi, tabelle, TOC, ecc.)
     sostituisci_xml_raw(doc.element.body, riga, colonne_valuta)
 
-    # 5. XML di header e footer (per sicurezza)
+    # Header e footer
     for sez in doc.sections:
-        sostituisci_xml_raw(sez.header._element, riga, colonne_valuta)
-        sostituisci_xml_raw(sez.footer._element, riga, colonne_valuta)
+        sostituisci_xml_raw(sez.header._element,  riga, colonne_valuta)
+        sostituisci_xml_raw(sez.footer._element,  riga, colonne_valuta)
         if sez.different_first_page_header_footer:
             sostituisci_xml_raw(sez.first_page_header._element, riga, colonne_valuta)
             sostituisci_xml_raw(sez.first_page_footer._element, riga, colonne_valuta)
 
+    # Normalizza TOC per renderizzazione corretta
+    normalizza_toc(doc)
+
     return doc
 
+def converti_con_word(docx_path, output_dir, fmt):
+    """Converte in PDF usando Microsoft Word via COM automation."""
+    try:
+        import comtypes.client
+    except ImportError:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "comtypes", "-q"])
+        import comtypes.client
+
+    docx_abs = os.path.abspath(docx_path)
+    fname    = os.path.splitext(os.path.basename(docx_abs))[0]
+    pdf_out  = os.path.abspath(os.path.join(output_dir, fname + ".pdf"))
+
+    word = None
+    doc  = None
+    try:
+        word = comtypes.client.CreateObject("Word.Application")
+        word.Visible = False
+        word.DisplayAlerts = 0
+        doc = word.Documents.Open(docx_abs, ReadOnly=False)
+        doc.Fields.Update()
+        for i in range(1, doc.TablesOfContents.Count + 1):
+            doc.TablesOfContents(i).Update()
+        doc.SaveAs2(pdf_out, FileFormat=17, AddToRecentFiles=False)
+    finally:
+        try:
+            if doc:  doc.Close(False)
+            if word: word.Quit()
+        except Exception:
+            pass
+
+def converti_con_libreoffice(docx_path, output_dir, soffice, fmt):
+    """Converte in PDF usando LibreOffice headless."""
+    import tempfile
+    filtro = (
+        "pdf:writer_pdf_Export:EmbedStandardFonts=true,SelectPdfVersion=1"
+        if fmt == "pdfa" else "pdf"
+    )
+    docx_abs   = os.path.abspath(docx_path)
+    output_abs = os.path.abspath(output_dir)
+    with tempfile.TemporaryDirectory() as tmp_profile:
+        profilo_url = "file:///" + tmp_profile.replace("\\", "/").replace(" ", "%20")
+        subprocess.run(
+            [soffice, "--headless", "--norestore", "--nofirststartwizard",
+             "-env:UserInstallation=" + profilo_url,
+             "--convert-to", filtro,
+             "--outdir", output_abs, docx_abs],
+            check=True,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=120
+        )
+
 def converti(docx_path, output_dir, soffice, fmt):
-    filtro = "pdf:writer_pdf_Export:EmbedStandardFonts=true,SelectPdfVersion=1" if fmt == "pdfa" else "pdf"
-    subprocess.run([soffice, "--headless", "--convert-to", filtro, "--outdir", output_dir, docx_path],
-                   check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    """Tenta prima con Word COM, poi fallback su LibreOffice."""
+    try:
+        converti_con_word(docx_path, output_dir, fmt)
+    except Exception:
+        if soffice:
+            converti_con_libreoffice(docx_path, output_dir, soffice, fmt)
+        else:
+            raise RuntimeError("Ne' Word ne' LibreOffice disponibili per la conversione PDF.")
 
 # ── Finestra selezione record ─────────────────────────────────────────────────
 class DialogSelezioneRecord(tk.Toplevel):
@@ -184,15 +244,15 @@ class DialogSelezioneRecord(tk.Toplevel):
 
         ctrl = tk.Frame(self, bg=BG, pady=8)
         ctrl.pack(fill="x", padx=16)
-        tk.Label(ctrl, text="🔍 Cerca:", font=(FONT, 9), bg=BG, fg=TEXT).pack(side="left")
+        tk.Label(ctrl, text="Cerca:", font=(FONT, 9), bg=BG, fg=TEXT).pack(side="left")
         self._search_var = tk.StringVar()
         self._search_var.trace_add("write", lambda *_: self._filtra())
         tk.Entry(ctrl, textvariable=self._search_var, font=(FONT, 9),
                  bg=CARD, relief="flat", highlightbackground=BORDER,
                  highlightthickness=1, width=28).pack(side="left", padx=(4, 16), ipady=4)
         for txt, cmd in [("Seleziona tutti", self._sel_tutti),
-                          ("Deseleziona tutti", self._desel_tutti),
-                          ("Inverti", self._inverti)]:
+                         ("Deseleziona tutti", self._desel_tutti),
+                         ("Inverti", self._inverti)]:
             tk.Button(ctrl, text=txt, font=(FONT, 9), bg=CARD, fg=ACCENT,
                       relief="flat", cursor="hand2", padx=8,
                       highlightbackground=BORDER, highlightthickness=1,
@@ -205,7 +265,7 @@ class DialogSelezioneRecord(tk.Toplevel):
         style = ttk.Style()
         style.configure("Treeview", font=(FONT, 9), rowheight=26, background=CARD, fieldbackground=CARD)
         style.configure("Treeview.Heading", font=(FONT, 9, "bold"))
-        self.tree.heading("sel", text="✔")
+        self.tree.heading("sel", text="v")
         self.tree.column("sel", width=36, anchor="center", stretch=False)
         for col in self.intestazioni:
             self.tree.heading(col, text=col)
@@ -225,7 +285,7 @@ class DialogSelezioneRecord(tk.Toplevel):
                   relief="flat", cursor="hand2", padx=16,
                   highlightbackground=BORDER, highlightthickness=1,
                   command=self._annulla).pack(side="right", padx=(8, 0), ipady=6)
-        tk.Button(footer, text="✔  Conferma", font=(FONT, 10, "bold"),
+        tk.Button(footer, text="Conferma", font=(FONT, 10, "bold"),
                   bg=ACCENT, fg="white", relief="flat", cursor="hand2", padx=16,
                   command=self._conferma).pack(side="right", ipady=6)
         self._aggiorna_contatore()
@@ -237,7 +297,7 @@ class DialogSelezioneRecord(tk.Toplevel):
         for i, riga in enumerate(self.righe):
             valori = [str(riga.get(col, "")) for col in self.intestazioni]
             if filtro and not any(filtro in v.lower() for v in valori): continue
-            chk = "☑" if self._checked.get(i, True) else "☐"
+            chk = "[x]" if self._checked.get(i, True) else "[ ]"
             tag = "checked" if self._checked.get(i, True) else "unchecked"
             iid = self.tree.insert("", "end", values=(chk,) + tuple(valori), tags=(tag,))
             self._item_to_idx[iid] = i
@@ -253,7 +313,7 @@ class DialogSelezioneRecord(tk.Toplevel):
         idx = self._item_to_idx.get(iid)
         if idx is None: return
         self._checked[idx] = not self._checked[idx]
-        chk = "☑" if self._checked[idx] else "☐"
+        chk = "[x]" if self._checked[idx] else "[ ]"
         tag = "checked" if self._checked[idx] else "unchecked"
         vals = self.tree.item(iid, "values")
         self.tree.item(iid, values=(chk,) + tuple(vals[1:]), tags=(tag,))
@@ -265,7 +325,7 @@ class DialogSelezioneRecord(tk.Toplevel):
         for iid, idx in self._item_to_idx.items():
             self._checked[idx] = True
             vals = self.tree.item(iid, "values")
-            self.tree.item(iid, values=("☑",) + tuple(vals[1:]), tags=("checked",))
+            self.tree.item(iid, values=("[x]",) + tuple(vals[1:]), tags=("checked",))
         self.tree.tag_configure("checked", background=CARD)
         self._aggiorna_contatore()
 
@@ -273,14 +333,14 @@ class DialogSelezioneRecord(tk.Toplevel):
         for iid, idx in self._item_to_idx.items():
             self._checked[idx] = False
             vals = self.tree.item(iid, "values")
-            self.tree.item(iid, values=("☐",) + tuple(vals[1:]), tags=("unchecked",))
+            self.tree.item(iid, values=("[ ]",) + tuple(vals[1:]), tags=("unchecked",))
         self.tree.tag_configure("unchecked", background="#F9FAFB", foreground=MUTED)
         self._aggiorna_contatore()
 
     def _inverti(self):
         for iid, idx in self._item_to_idx.items():
             self._checked[idx] = not self._checked[idx]
-            chk = "☑" if self._checked[idx] else "☐"
+            chk = "[x]" if self._checked[idx] else "[ ]"
             tag = "checked" if self._checked[idx] else "unchecked"
             vals = self.tree.item(iid, "values")
             self.tree.item(iid, values=(chk,) + tuple(vals[1:]), tags=(tag,))
@@ -290,7 +350,7 @@ class DialogSelezioneRecord(tk.Toplevel):
 
     def _aggiorna_contatore(self):
         sel = sum(1 for v in self._checked.values() if v)
-        self._lbl_count.set(f"{sel} di {len(self.righe)} selezionati")
+        self._lbl_count.set(str(sel) + " di " + str(len(self.righe)) + " selezionati")
 
     def _conferma(self):
         self.risultato = [i for i, v in self._checked.items() if v]
@@ -319,16 +379,15 @@ class MailMergeApp(tk.Tk):
         self._intestazioni = []
         self._righe = []
         self._righe_selezionate = []
+        self._colonne_valuta = set()
+        self._valuta_checks  = {}
 
         self.nome_fisso = tk.StringVar(value="documento")
         self.sep1       = tk.StringVar(value="_")
         self.sep2       = tk.StringVar(value="_")
         self.campo1     = tk.StringVar(value="(nessuno)")
         self.campo2     = tk.StringVar(value="(nessuno)")
-        # Ordine blocchi: "fisso", "campo1", "campo2"
         self._blocchi_ordine = ["fisso", "campo1", "campo2"]
-        # Colonne con formato valuta
-        self._colonne_valuta = set()
 
         self._build_ui()
 
@@ -336,26 +395,23 @@ class MailMergeApp(tk.Tk):
             var.trace_add("write", lambda *_: self._aggiorna_anteprima_nome())
 
     def _build_ui(self):
-        # ── Header fisso ──
         hdr = tk.Frame(self, bg=ACCENT, height=56)
         hdr.pack(fill="x", side="top")
         hdr.pack_propagate(False)
-        tk.Label(hdr, text="📄  Mail Merge", font=(FONT, 15, "bold"),
+        tk.Label(hdr, text="Mail Merge", font=(FONT, 15, "bold"),
                  bg=ACCENT, fg="white").pack(side="left", padx=20)
         tk.Label(hdr, text="Genera documenti personalizzati da template Word",
                  font=(FONT, 9), bg=ACCENT, fg="#C7D2FE").pack(side="left")
 
-        # ── Bottone fisso in fondo ──
         btn_frame = tk.Frame(self, bg=BG)
         btn_frame.pack(fill="x", side="bottom", padx=20, pady=(0, 16))
-        self.btn = tk.Button(btn_frame, text="▶   Avvia generazione",
+        self.btn = tk.Button(btn_frame, text="Avvia generazione",
                              font=(FONT, 11, "bold"), bg=ACCENT, fg="white",
                              activebackground=ACCENT2, activeforeground="white",
                              relief="flat", cursor="hand2", height=2,
                              command=self._avvia)
         self.btn.pack(fill="x")
 
-        # ── Area scrollabile ──
         scroll_container = tk.Frame(self, bg=BG)
         scroll_container.pack(fill="both", expand=True, side="top")
 
@@ -373,25 +429,17 @@ class MailMergeApp(tk.Tk):
         self._body = tk.Frame(canvas, bg=BG)
         body_id = canvas.create_window((0, 0), window=self._body, anchor="nw")
 
-        def on_configure(e):
-            canvas.configure(scrollregion=canvas.bbox("all"))
-        def on_canvas_resize(e):
-            canvas.itemconfig(body_id, width=e.width)
+        def on_configure(e): canvas.configure(scrollregion=canvas.bbox("all"))
+        def on_canvas_resize(e): canvas.itemconfig(body_id, width=e.width)
         self._body.bind("<Configure>", on_configure)
         canvas.bind("<Configure>", on_canvas_resize)
-
-        # Scroll con rotella del mouse
-        def on_mousewheel(e):
-            canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
-        canvas.bind_all("<MouseWheel>", on_mousewheel)
+        canvas.bind_all("<MouseWheel>", lambda e: canvas.yview_scroll(int(-1*(e.delta/120)), "units"))
 
         self._build_body(self._body)
 
     def _build_body(self, body):
-        pad = {"padx": 20, "pady": (0, 12)}
-
-        # ── Origine dati ──
-        xlsx_sec = self._section(body, "📊  Origine dati (Excel)")
+        # Origine dati
+        xlsx_sec = self._section(body, "Origine dati (Excel)")
         xlsx_inner = tk.Frame(xlsx_sec, bg=CARD)
         xlsx_inner.pack(fill="x", padx=16, pady=10)
         self._xlsx_entry = tk.Entry(xlsx_inner, textvariable=self.xlsx_path,
@@ -399,82 +447,73 @@ class MailMergeApp(tk.Tk):
                                     relief="flat", highlightbackground=BORDER, highlightthickness=1)
         self._xlsx_entry.insert(0, "Seleziona file .xlsx")
         self._xlsx_entry.pack(side="left", fill="x", expand=True, ipady=6, padx=(0, 8))
-        tk.Button(xlsx_inner, text="Sfoglia…", font=(FONT, 9), bg=ACCENT, fg="white",
+        tk.Button(xlsx_inner, text="Sfoglia...", font=(FONT, 9), bg=ACCENT, fg="white",
                   activebackground=ACCENT2, activeforeground="white",
                   relief="flat", cursor="hand2", padx=12,
                   command=self._carica_xlsx).pack(side="left", ipady=5, padx=(0, 8))
-        self.btn_record = tk.Button(xlsx_inner, text="👁  Vedi record",
+        self.btn_record = tk.Button(xlsx_inner, text="Vedi record",
                                     font=(FONT, 9), bg=CARD, fg=ACCENT,
                                     relief="flat", cursor="hand2", padx=8,
                                     highlightbackground=BORDER, highlightthickness=1,
                                     state="disabled", command=self._apri_selezione)
         self.btn_record.pack(side="left", ipady=5)
-        self._lbl_record = tk.Label(xlsx_sec, text="", font=(FONT, 9),
-                                    bg=CARD, fg=MUTED, padx=16)
+        self._lbl_record = tk.Label(xlsx_sec, text="", font=(FONT, 9), bg=CARD, fg=MUTED, padx=16)
         self._lbl_record.pack(anchor="w", pady=(0, 8))
 
-        # ── Template Word ──
-        self._card(body, "📝  Template documento (Word)", self.docx_path,
+        # Template Word
+        self._card(body, "Template documento (Word)", self.docx_path,
                    "Seleziona file .docx",
                    lambda: self._browse_file(self.docx_path, [("Word", "*.docx")]))
 
-        # ── Output ──
-        self._card(body, "📁  Cartella di output", self.out_dir,
+        # Output
+        self._card(body, "Cartella di output", self.out_dir,
                    "Seleziona cartella di destinazione",
                    lambda: self._browse_dir(self.out_dir))
 
-        # ── Nome file ──
-        nome_sec = self._section(body, "🏷️  Nome file esportato")
+        # Nome file
+        nome_sec = self._section(body, "Nome file esportato")
         self._nome_container = tk.Frame(nome_sec, bg=CARD)
         self._nome_container.pack(fill="x", padx=16, pady=(8, 4))
 
-        sep_vals = ["_", "-", " ", ".", ""]
-
-        # Blocco parte fissa
         self._frame_fisso = tk.Frame(self._nome_container, bg=CARD,
                                       highlightbackground=BORDER, highlightthickness=1)
         self._frame_fisso.pack(fill="x", pady=3)
         self._build_blocco_fisso(self._frame_fisso)
 
-        # Blocco campo1
         self._frame_campo1 = tk.Frame(self._nome_container, bg=CARD,
                                        highlightbackground=BORDER, highlightthickness=1)
         self._frame_campo1.pack(fill="x", pady=3)
         self._build_blocco_campo(self._frame_campo1, "campo1", self.sep1, self.campo1)
 
-        # Blocco campo2
         self._frame_campo2 = tk.Frame(self._nome_container, bg=CARD,
                                        highlightbackground=BORDER, highlightthickness=1)
         self._frame_campo2.pack(fill="x", pady=3)
         self._build_blocco_campo(self._frame_campo2, "campo2", self.sep2, self.campo2)
 
-        # Anteprima
         prev_row = tk.Frame(nome_sec, bg=CARD)
         prev_row.pack(fill="x", padx=16, pady=(4, 10))
         tk.Label(prev_row, text="Anteprima:", font=(FONT, 8), bg=CARD, fg=MUTED).pack(side="left")
         self._lbl_anteprima = tk.Label(prev_row, text="documento.pdf",
-                                        font=("Consolas", 9), bg="#EEF2FF",
-                                        fg=ACCENT, padx=8, pady=3)
+                                        font=("Consolas", 9), bg="#EEF2FF", fg=ACCENT, padx=8, pady=3)
         self._lbl_anteprima.pack(side="left", padx=(6, 0))
 
-        # ── Formato valuta ──
-        valuta_sec = self._section(body, "💶  Formato valuta")
+        # Formato valuta
+        valuta_sec = self._section(body, "Formato valuta")
         valuta_inner = tk.Frame(valuta_sec, bg=CARD)
         valuta_inner.pack(fill="x", padx=16, pady=(6, 12))
         self._lbl_valuta_info = tk.Label(valuta_inner,
                                           text="Nessuna colonna configurata come valuta.",
                                           font=(FONT, 9), bg=CARD, fg=MUTED)
         self._lbl_valuta_info.pack(side="left", expand=True, anchor="w")
-        self._btn_valuta = tk.Button(valuta_inner, text="⚙️  Configura colonne",
+        self._btn_valuta = tk.Button(valuta_inner, text="Configura colonne",
                                       font=(FONT, 9), bg=ACCENT, fg="white",
                                       activebackground=ACCENT2, activeforeground="white",
                                       relief="flat", cursor="hand2", padx=12,
-                                      state="disabled",
-                                      command=self._apri_dialog_valuta)
+                                      state="disabled", command=self._apri_dialog_valuta)
         self._btn_valuta.pack(side="right", ipady=5)
 
-        # ── Formato ──
-        fmt_sec = self._section(body, "📤  Formato di esportazione")
+        # Formato esportazione
+        fmt_sec = self._section(body, "Formato di esportazione")
         fmt_inner = tk.Frame(fmt_sec, bg=CARD)
         fmt_inner.pack(fill="x", padx=16, pady=(4, 14))
         for val, lbl, desc in [("pdf",  "PDF",   "Documento PDF standard"),
@@ -485,33 +524,27 @@ class MailMergeApp(tk.Tk):
             tk.Radiobutton(row, text=lbl, variable=self.fmt, value=val,
                            font=(FONT, 10, "bold"), bg=CARD, fg=TEXT,
                            activebackground=CARD, selectcolor=CARD).pack(side="left")
-            tk.Label(row, text=desc, font=(FONT, 9), bg=CARD,
-                     fg=MUTED).pack(side="left", padx=8)
+            tk.Label(row, text=desc, font=(FONT, 9), bg=CARD, fg=MUTED).pack(side="left", padx=8)
 
-        # ── Progress + Log ──
-        # ── Progress + Log ──
+        # Progress + Log
         prog_frame = tk.Frame(body, bg=BG)
         prog_frame.pack(fill="x", padx=20, pady=(4, 0))
 
-        # Riga contatore e pulsante stop
         top_row = tk.Frame(prog_frame, bg=BG)
         top_row.pack(fill="x", pady=(0, 4))
         self.prog_label = tk.Label(top_row, text="", font=(FONT, 9), bg=BG, fg=MUTED)
         self.prog_label.pack(side="left")
-        self.btn_stop = tk.Button(top_row, text="⏹  Interrompi",
+        self.btn_stop = tk.Button(top_row, text="Interrompi",
                                    font=(FONT, 9, "bold"), bg="#DC2626", fg="white",
                                    activebackground="#B91C1C", activeforeground="white",
                                    relief="flat", cursor="hand2", padx=10,
                                    state="disabled", command=self._stop)
         self.btn_stop.pack(side="right", ipady=3)
 
-        # Barra di avanzamento
         self.prog_bar = ttk.Progressbar(prog_frame, mode="determinate")
         self.prog_bar.pack(fill="x", pady=(0, 4))
 
-        # Etichetta dettaglio sotto la barra
-        self.prog_detail = tk.Label(prog_frame, text="", font=("Consolas", 8),
-                                     bg=BG, fg=MUTED)
+        self.prog_detail = tk.Label(prog_frame, text="", font=("Consolas", 8), bg=BG, fg=MUTED)
         self.prog_detail.pack(anchor="w")
 
         log_frame = tk.Frame(body, bg=CARD, highlightbackground=BORDER, highlightthickness=1)
@@ -527,44 +560,37 @@ class MailMergeApp(tk.Tk):
     def _build_blocco_fisso(self, frame):
         inner = tk.Frame(frame, bg="#F0F0FF", padx=8, pady=6)
         inner.pack(fill="x")
-        tk.Label(inner, text="📌 Parte fissa", font=(FONT, 8, "bold"),
+        tk.Label(inner, text="Parte fissa", font=(FONT, 8, "bold"),
                  bg="#F0F0FF", fg=ACCENT, width=14, anchor="w").pack(side="left")
         tk.Entry(inner, textvariable=self.nome_fisso, font=(FONT, 9),
                  bg=CARD, relief="flat", highlightbackground=BORDER,
                  highlightthickness=1, width=22).pack(side="left", ipady=4, padx=(4, 12))
-        tk.Button(inner, text="▲", font=(FONT, 8), bg=CARD, fg=TEXT,
-                  relief="flat", cursor="hand2", padx=4,
+        tk.Button(inner, text="Su",  font=(FONT, 8), bg=CARD, fg=TEXT, relief="flat", cursor="hand2", padx=4,
                   command=lambda: self._sposta("fisso", -1)).pack(side="right", padx=2)
-        tk.Button(inner, text="▼", font=(FONT, 8), bg=CARD, fg=TEXT,
-                  relief="flat", cursor="hand2", padx=4,
+        tk.Button(inner, text="Giu", font=(FONT, 8), bg=CARD, fg=TEXT, relief="flat", cursor="hand2", padx=4,
                   command=lambda: self._sposta("fisso", 1)).pack(side="right", padx=2)
         tk.Label(inner, text="Ordine:", font=(FONT, 8), bg="#F0F0FF", fg=MUTED).pack(side="right", padx=4)
 
     def _build_blocco_campo(self, frame, chiave, sep_var, campo_var):
-        etichetta = "🔵 Campo dinamico 1" if chiave == "campo1" else "🟢 Campo dinamico 2"
+        etichetta = "Campo dinamico 1" if chiave == "campo1" else "Campo dinamico 2"
         colore_bg = "#F0FFF4" if chiave == "campo2" else "#EFF6FF"
         inner = tk.Frame(frame, bg=colore_bg, padx=8, pady=6)
         inner.pack(fill="x")
         tk.Label(inner, text=etichetta, font=(FONT, 8, "bold"),
                  bg=colore_bg, fg=TEXT, width=18, anchor="w").pack(side="left")
         tk.Label(inner, text="Sep.", font=(FONT, 8), bg=colore_bg, fg=MUTED).pack(side="left", padx=(0, 2))
-        ttk.Combobox(inner, textvariable=sep_var,
-                     values=["_", "-", " ", ".", ""],
+        ttk.Combobox(inner, textvariable=sep_var, values=["_", "-", " ", ".", ""],
                      width=4, font=(FONT, 9), state="readonly").pack(side="left", padx=(0, 8))
         tk.Label(inner, text="Colonna:", font=(FONT, 8), bg=colore_bg, fg=MUTED).pack(side="left", padx=(0, 2))
         cb = ttk.Combobox(inner, textvariable=campo_var,
                           values=["(nessuno)"] + self._intestazioni,
                           width=20, font=(FONT, 9), state="readonly")
         cb.pack(side="left", padx=(0, 12))
-        if chiave == "campo1":
-            self._cb_campo1 = cb
-        else:
-            self._cb_campo2 = cb
-        tk.Button(inner, text="▲", font=(FONT, 8), bg=CARD, fg=TEXT,
-                  relief="flat", cursor="hand2", padx=4,
+        if chiave == "campo1": self._cb_campo1 = cb
+        else:                  self._cb_campo2 = cb
+        tk.Button(inner, text="Su",  font=(FONT, 8), bg=CARD, fg=TEXT, relief="flat", cursor="hand2", padx=4,
                   command=lambda k=chiave: self._sposta(k, -1)).pack(side="right", padx=2)
-        tk.Button(inner, text="▼", font=(FONT, 8), bg=CARD, fg=TEXT,
-                  relief="flat", cursor="hand2", padx=4,
+        tk.Button(inner, text="Giu", font=(FONT, 8), bg=CARD, fg=TEXT, relief="flat", cursor="hand2", padx=4,
                   command=lambda k=chiave: self._sposta(k, 1)).pack(side="right", padx=2)
         tk.Label(inner, text="Ordine:", font=(FONT, 8), bg=colore_bg, fg=MUTED).pack(side="right", padx=4)
 
@@ -578,15 +604,9 @@ class MailMergeApp(tk.Tk):
         self._aggiorna_anteprima_nome()
 
     def _ridisegna_blocchi(self):
-        mappa = {
-            "fisso":  self._frame_fisso,
-            "campo1": self._frame_campo1,
-            "campo2": self._frame_campo2,
-        }
-        for w in self._nome_container.winfo_children():
-            w.pack_forget()
-        for chiave in self._blocchi_ordine:
-            mappa[chiave].pack(fill="x", pady=3)
+        mappa = {"fisso": self._frame_fisso, "campo1": self._frame_campo1, "campo2": self._frame_campo2}
+        for w in self._nome_container.winfo_children(): w.pack_forget()
+        for chiave in self._blocchi_ordine: mappa[chiave].pack(fill="x", pady=3)
 
     def _apri_dialog_valuta(self):
         dlg = tk.Toplevel(self)
@@ -596,36 +616,27 @@ class MailMergeApp(tk.Tk):
         dlg.configure(bg=BG)
         dlg.grab_set()
 
-        # Header
         hdr = tk.Frame(dlg, bg=ACCENT, height=44)
         hdr.pack(fill="x")
         hdr.pack_propagate(False)
-        tk.Label(hdr, text="💶  Seleziona colonne da formattare come valuta",
+        tk.Label(hdr, text="Seleziona colonne da formattare come valuta",
                  font=(FONT, 9, "bold"), bg=ACCENT, fg="white").pack(side="left", padx=12)
 
-        tk.Label(dlg, text="Le colonne selezionate verranno esportate nel formato  € 1.234,56",
+        tk.Label(dlg, text="Le colonne selezionate verranno esportate nel formato EUR 1.234,56",
                  font=(FONT, 8), bg=BG, fg=MUTED, wraplength=340).pack(padx=16, pady=(10, 6), anchor="w")
 
-        # Lista scrollabile
         list_frame = tk.Frame(dlg, bg=CARD, highlightbackground=BORDER, highlightthickness=1)
         list_frame.pack(fill="both", expand=True, padx=16, pady=(0, 8))
-
         canvas = tk.Canvas(list_frame, bg=CARD, highlightthickness=0)
         vsb = ttk.Scrollbar(list_frame, orient="vertical", command=canvas.yview)
         canvas.configure(yscrollcommand=vsb.set)
         vsb.pack(side="right", fill="y")
         canvas.pack(side="left", fill="both", expand=True)
-
         inner = tk.Frame(canvas, bg=CARD)
         win_id = canvas.create_window((0, 0), window=inner, anchor="nw")
+        inner.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>", lambda e: canvas.itemconfig(win_id, width=e.width))
 
-        def on_cfg(e): canvas.configure(scrollregion=canvas.bbox("all"))
-        def on_resize(e): canvas.itemconfig(win_id, width=e.width)
-        inner.bind("<Configure>", on_cfg)
-        canvas.bind("<Configure>", on_resize)
-        canvas.bind_all("<MouseWheel>", lambda e: canvas.yview_scroll(int(-1*(e.delta/120)), "units"))
-
-        # Checkbox per ogni colonna
         checks = {}
         for col in self._intestazioni:
             var = tk.BooleanVar(value=(col in self._colonne_valuta))
@@ -635,41 +646,33 @@ class MailMergeApp(tk.Tk):
             tk.Checkbutton(row, text=col, variable=var,
                            font=(FONT, 9), bg=CARD, fg=TEXT,
                            activebackground=CARD, selectcolor=CARD).pack(side="left")
-            # Mostra esempio valore dal primo record
             if self._righe:
                 val = self._righe[0].get(col, "")
                 try:
                     n = float(str(val).replace(",", "."))
-                    esempio = f"→  € {n:,.2f}".replace(",","X").replace(".",",").replace("X",".")
+                    esempio = "EUR " + "{:.2f}".format(n).replace(".", ",")
                     tk.Label(row, text=esempio, font=("Consolas", 8),
                              bg=CARD, fg=SUCCESS).pack(side="right", padx=8)
                 except (ValueError, TypeError):
                     pass
 
-        # Footer
         footer = tk.Frame(dlg, bg=BG)
         footer.pack(fill="x", padx=16, pady=(0, 12))
-
-        def seleziona_tutti():
-            for v in checks.values(): v.set(True)
-        def deseleziona_tutti():
-            for v in checks.values(): v.set(False)
-
         tk.Button(footer, text="Seleziona tutti", font=(FONT, 9), bg=CARD, fg=ACCENT,
                   relief="flat", cursor="hand2", padx=8,
                   highlightbackground=BORDER, highlightthickness=1,
-                  command=seleziona_tutti).pack(side="left", ipady=4, padx=(0, 6))
+                  command=lambda: [v.set(True) for v in checks.values()]).pack(side="left", ipady=4, padx=(0, 6))
         tk.Button(footer, text="Deseleziona tutti", font=(FONT, 9), bg=CARD, fg=ACCENT,
                   relief="flat", cursor="hand2", padx=8,
                   highlightbackground=BORDER, highlightthickness=1,
-                  command=deseleziona_tutti).pack(side="left", ipady=4)
+                  command=lambda: [v.set(False) for v in checks.values()]).pack(side="left", ipady=4)
 
         def conferma():
             self._colonne_valuta = {col for col, v in checks.items() if v.get()}
             self._aggiorna_label_valuta()
             dlg.destroy()
 
-        tk.Button(footer, text="✔  Conferma", font=(FONT, 10, "bold"),
+        tk.Button(footer, text="Conferma", font=(FONT, 10, "bold"),
                   bg=ACCENT, fg="white", activebackground=ACCENT2,
                   relief="flat", cursor="hand2", padx=16,
                   command=conferma).pack(side="right", ipady=6)
@@ -682,14 +685,7 @@ class MailMergeApp(tk.Tk):
         if not self._colonne_valuta:
             self._lbl_valuta_info.config(text="Nessuna colonna configurata come valuta.", fg=MUTED)
         else:
-            cols = ", ".join(sorted(self._colonne_valuta))
-            self._lbl_valuta_info.config(text=f"Valuta: {cols}", fg=SUCCESS)
-
-    def _aggiorna_sezione_valuta(self):
-        pass  # mantenuto per compatibilità
-
-    def _aggiorna_colonne_valuta(self):
-        pass  # mantenuto per compatibilità
+            self._lbl_valuta_info.config(text="Valuta: " + ", ".join(sorted(self._colonne_valuta)), fg=SUCCESS)
 
     def _section(self, parent, title):
         frame = tk.Frame(parent, bg=CARD, highlightbackground=BORDER, highlightthickness=1)
@@ -714,7 +710,7 @@ class MailMergeApp(tk.Tk):
             if not en.get(): en.insert(0, ph); en.config(fg=MUTED)
         e.bind("<FocusIn>", fi)
         e.bind("<FocusOut>", fo)
-        tk.Button(inner, text="Sfoglia…", font=(FONT, 9), bg=ACCENT, fg="white",
+        tk.Button(inner, text="Sfoglia...", font=(FONT, 9), bg=ACCENT, fg="white",
                   activebackground=ACCENT2, activeforeground="white",
                   relief="flat", cursor="hand2", padx=12,
                   command=cmd).pack(side="right", ipady=5)
@@ -745,7 +741,6 @@ class MailMergeApp(tk.Tk):
             self._xlsx_entry.config(fg=TEXT)
             self.btn_record.config(state="normal")
             self._aggiorna_label_record()
-            # Aggiorna combobox campi dinamici
             cols = ["(nessuno)"] + self._intestazioni
             self._cb_campo1.config(values=cols)
             self._cb_campo2.config(values=cols)
@@ -753,12 +748,12 @@ class MailMergeApp(tk.Tk):
             if self.campo2.get() not in cols: self.campo2.set("(nessuno)")
             self._btn_valuta.config(state="normal")
             self._colonne_valuta = set()
-            self._valuta_checks = {}
+            self._valuta_checks  = {}
             self._aggiorna_label_valuta()
             self._aggiorna_anteprima_nome()
-            self._log(f"Excel caricato: {len(self._righe)} record, colonne: {', '.join(self._intestazioni)}", "info")
+            self._log("Excel caricato: " + str(len(self._righe)) + " record, colonne: " + ", ".join(self._intestazioni), "info")
         except Exception as e:
-            messagebox.showerror("Errore", f"Impossibile leggere il file Excel:\n{e}")
+            messagebox.showerror("Errore", "Impossibile leggere il file Excel:\n" + str(e))
 
     def _apri_selezione(self):
         dlg = DialogSelezioneRecord(self, self._intestazioni, self._righe, self._righe_selezionate)
@@ -772,21 +767,10 @@ class MailMergeApp(tk.Tk):
         tot = len(self._righe)
         sel = len(self._righe_selezionate)
         self._lbl_record.config(
-            text=f"✔  {sel} di {tot} record selezionati",
+            text=str(sel) + " di " + str(tot) + " record selezionati",
             fg=SUCCESS if sel > 0 else ERROR)
 
-    def _formatta_valore(self, colonna, valore):
-        """Formatta il valore come valuta se la colonna è marcata."""
-        if colonna in self._colonne_valuta:
-            try:
-                n = float(str(valore).replace(",", "."))
-                return f"€ {n:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
-            except (ValueError, TypeError):
-                return valore
-        return valore
-
     def _get_parti_nome(self, riga):
-        """Restituisce le parti del nome file nell'ordine corrente."""
         esempio = riga or {}
         parti = []
         mappa_val = {
@@ -811,7 +795,7 @@ class MailMergeApp(tk.Tk):
         parti = self._get_parti_nome(esempio)
         nome = re.sub(r'[^a-zA-Z0-9_\-. ]', '_', "".join(parti) or "documento")
         ext = "pdf" if self.fmt.get() in ("pdf", "pdfa") else "docx"
-        self._lbl_anteprima.config(text=f"{nome}.{ext}")
+        self._lbl_anteprima.config(text=nome + "." + ext)
 
     def _build_nome_file(self, riga):
         parti = self._get_parti_nome(riga)
@@ -837,18 +821,31 @@ class MailMergeApp(tk.Tk):
             messagebox.showerror("Errore", "Seleziona una cartella di output valida."); return
         if not self._righe_selezionate:
             messagebox.showwarning("Nessun record", "Nessun record selezionato."); return
+
+        soffice = None
         if fmt in ("pdf", "pdfa"):
-            soffice = trova_libreoffice()
-            if not soffice:
-                if messagebox.askyesno("LibreOffice non trovato",
-                    "LibreOffice è necessario per i PDF.\nVuoi installarlo adesso?"):
-                    threading.Thread(target=self._installa_libreoffice, daemon=True).start()
-                return
-        else:
-            soffice = None
+            # Verifica Word COM
+            word_ok = False
+            try:
+                import comtypes.client
+                w = comtypes.client.CreateObject("Word.Application")
+                w.Quit()
+                word_ok = True
+                self._log("Microsoft Word rilevato per la conversione PDF.", "info")
+            except Exception:
+                pass
+            if not word_ok:
+                soffice = trova_libreoffice()
+                if not soffice:
+                    if messagebox.askyesno("Convertitore non trovato",
+                        "Ne' Word ne' LibreOffice sono disponibili.\nVuoi installare LibreOffice?"):
+                        threading.Thread(target=self._installa_libreoffice, daemon=True).start()
+                    return
+                self._log("LibreOffice rilevato per la conversione PDF.", "info")
+
         self._stop_flag = False
         self.running = True
-        self.btn.config(state="disabled", text="⏳  Generazione in corso...")
+        self.btn.config(state="disabled", text="Generazione in corso...")
         self.btn_stop.config(state="normal")
         self.log.config(state="normal"); self.log.delete("1.0", "end"); self.log.config(state="disabled")
         self.prog_bar["value"] = 0
@@ -859,67 +856,64 @@ class MailMergeApp(tk.Tk):
 
     def _stop(self):
         self._stop_flag = True
-        self.btn_stop.config(state="disabled", text="⏹  Interruzione...")
-        self._log("⚠️  Interruzione richiesta — attendi il completamento del file corrente...", "err")
+        self.btn_stop.config(state="disabled", text="Interruzione...")
+        self._log("Interruzione richiesta — attendi il completamento del file corrente...", "err")
 
     def _run(self, docx, out, fmt, soffice, righe):
         try:
             totale = len(righe)
-            self._log(f"Avvio elaborazione di {totale} record...", "info")
+            self._log("Avvio elaborazione di " + str(totale) + " record...", "info")
             tmp = os.path.join(out, "_tmp_merge")
             os.makedirs(tmp, exist_ok=True)
             ok = err = 0
             for idx, riga in enumerate(righe):
                 if self._stop_flag:
-                    self._log(f"\n⏹  Generazione interrotta dopo {idx} di {totale} record.", "err")
+                    self._log("Generazione interrotta dopo " + str(idx) + " di " + str(totale) + " record.", "err")
                     break
-                fname = self._build_nome_file(riga)
-                docx_tmp = os.path.join(tmp, f"{fname}.docx")
+                fname    = self._build_nome_file(riga)
+                docx_tmp = os.path.join(tmp, fname + ".docx")
                 try:
                     doc = processa_documento(docx, riga, self._colonne_valuta)
                     doc.save(docx_tmp)
                     if fmt in ("pdf", "pdfa"):
                         converti(docx_tmp, out, soffice, fmt)
                     else:
-                        shutil.copy(docx_tmp, os.path.join(out, f"{fname}.docx"))
+                        shutil.copy(docx_tmp, os.path.join(out, fname + ".docx"))
                     ext = "pdf" if fmt in ("pdf", "pdfa") else "docx"
-                    self._log(f"  [{idx+1}/{totale}]  {fname}.{ext}", "ok")
+                    self._log("  [" + str(idx+1) + "/" + str(totale) + "]  " + fname + "." + ext, "ok")
                     ok += 1
                 except Exception as e:
-                    self._log(f"  [{idx+1}/{totale}]  ERRORE su {fname}: {e}", "err")
+                    self._log("  [" + str(idx+1) + "/" + str(totale) + "]  ERRORE su " + fname + ": " + str(e), "err")
                     err += 1
 
                 pct = int(((idx+1) / totale) * 100)
                 self.prog_bar["value"] = pct
-                self.prog_label.config(
-                    text=f"Elaborati {idx+1} di {totale}  ({pct}%)")
-                self.prog_detail.config(
-                    text=f"✔ {ok} completati   ✖ {err} errori   "
-                         f"{'⏹ interrotto' if self._stop_flag else f'▶ rimanenti: {totale - idx - 1}'}")
+                self.prog_label.config(text="Elaborati " + str(idx+1) + " di " + str(totale) + "  (" + str(pct) + "%)")
+                rim = "interrotto" if self._stop_flag else ("rimanenti: " + str(totale - idx - 1))
+                self.prog_detail.config(text=str(ok) + " completati   " + str(err) + " errori   " + rim)
                 self.update_idletasks()
 
             shutil.rmtree(tmp, ignore_errors=True)
             if self._stop_flag:
-                self.prog_label.config(text=f"Interrotto: {ok} generati su {totale}, {err} errori.")
+                self.prog_label.config(text="Interrotto: " + str(ok) + " generati su " + str(totale) + ", " + str(err) + " errori.")
             else:
-                self.prog_label.config(text=f"Completato: {ok} generati, {err} errori.")
-                self.prog_detail.config(text=f"✔ {ok} completati   ✖ {err} errori   ▶ rimanenti: 0")
-            self._log(f"\n{'⏹' if self._stop_flag else '✅'}  {'Interrotto' if self._stop_flag else 'Completato'}: {ok} file in '{out}'", "info")
-            if err: self._log(f"⚠️  {err} errori riscontrati.", "err")
+                self.prog_label.config(text="Completato: " + str(ok) + " generati, " + str(err) + " errori.")
+            self._log("Completato: " + str(ok) + " file in '" + out + "'", "info")
+            if err: self._log(str(err) + " errori riscontrati.", "err")
             if ok and not self._stop_flag:
-                messagebox.showinfo("Completato", f"{ok} file generati con successo in:\n{out}")
+                messagebox.showinfo("Completato", str(ok) + " file generati con successo in:\n" + out)
             elif ok and self._stop_flag:
-                messagebox.showwarning("Interrotto", f"Generazione interrotta.\n{ok} file salvati in:\n{out}")
+                messagebox.showwarning("Interrotto", "Generazione interrotta.\n" + str(ok) + " file salvati in:\n" + out)
         except Exception as e:
-            self._log(f"Errore generale: {e}", "err")
+            self._log("Errore generale: " + str(e), "err")
             messagebox.showerror("Errore", str(e))
         self.running = False
         self._stop_flag = False
-        self.btn.config(state="normal", text="▶   Avvia generazione")
-        self.btn_stop.config(state="disabled", text="⏹  Interrompi")
+        self.btn.config(state="normal", text="Avvia generazione")
+        self.btn_stop.config(state="disabled", text="Interrompi")
 
     def _installa_libreoffice(self):
-        self.btn.config(state="disabled", text="⏳  Installazione LibreOffice...")
+        self.btn.config(state="disabled", text="Installazione LibreOffice...")
         self.prog_label.config(text="Installazione in corso...")
         self.prog_bar.config(mode="indeterminate")
         self.prog_bar.start(10)
@@ -945,9 +939,9 @@ class MailMergeApp(tk.Tk):
             messagebox.showerror("Errore", "Scarica LibreOffice da:\nhttps://www.libreoffice.org/download/")
         except Exception as e:
             self.prog_bar.stop(); self.prog_bar.config(mode="determinate")
-            self._log(f"Errore: {e}", "err")
+            self._log("Errore: " + str(e), "err")
         finally:
-            self.btn.config(state="normal", text="▶   Avvia generazione")
+            self.btn.config(state="normal", text="Avvia generazione")
             self.prog_label.config(text="")
 
 if __name__ == "__main__":
