@@ -7,8 +7,7 @@ Librerie installate automaticamente: python-docx, openpyxl
 Avvio: python mail_merge_gui.py
 """
 
-import subprocess, sys, os, re, shutil, threading, multiprocessing
-multiprocessing.freeze_support()  # richiesto da PyInstaller su Windows
+import subprocess, sys, os, re, shutil, threading
 
 # ── Log errori a file (utile quando compilato con PyInstaller) ───────────────
 import traceback
@@ -28,14 +27,11 @@ def _log_crash(exc_type, exc_value, exc_tb):
 
 sys.excepthook = _log_crash
 
-# Quando impacchettato con PyInstaller sys.frozen=True e i pacchetti
-# sono già inclusi nel bundle — l'auto-install va saltato.
-if not getattr(sys, "frozen", False):
-    for pkg in ["python-docx", "openpyxl", "pikepdf"]:
-        try:
-            __import__(pkg.replace("-", "_").split(".")[0])
-        except ImportError:
-            subprocess.check_call([sys.executable, "-m", "pip", "install", pkg, "-q"])
+for pkg in ["python-docx", "openpyxl"]:
+    try:
+        __import__(pkg.replace("-", "_").split(".")[0])
+    except ImportError:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", pkg, "-q"])
 
 import openpyxl
 from docx import Document
@@ -68,17 +64,42 @@ def sostituisci_paragrafo(para, riga):
         para.runs[0].text = testo
         for r in para.runs[1:]: r.text = ""
 
+def sostituisci_xml_raw(elemento, riga, colonne_valuta=None):
+    """
+    Sostituisce i segnaposto direttamente nell'XML dell'elemento,
+    utile per raggiungere nodi non esposti da python-docx
+    (indici, TOC, content controls, campi strutturati, ecc.)
+    """
+    colonne_valuta = colonne_valuta or set()
+    ns = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+
+    # Tutti i nodi <w:t> dentro l'elemento
+    for t in elemento.iter("{%s}t" % ns):
+        if t.text and "{{" in t.text:
+            def repl(m):
+                chiave = m.group(1).strip()
+                val = riga.get(chiave, m.group(0))
+                if chiave in colonne_valuta:
+                    try:
+                        n = float(str(val).replace(",", "."))
+                        val = "€ {:.2f}".format(n).replace(",", "X").replace(".", ",").replace("X", ".")
+                    except (ValueError, TypeError):
+                        pass
+                return str(val)
+            t.text = re.sub(r'\{\{([^}]+)\}\}', repl, t.text)
+
 def sostituisci_paragrafo(para, riga, colonne_valuta=None):
     colonne_valuta = colonne_valuta or set()
     testo = "".join(r.text for r in para.runs)
-    if "{{" not in testo: return
+    if "{{" not in testo:
+        return
     def repl(m):
         chiave = m.group(1).strip()
         val = riga.get(chiave, m.group(0))
         if chiave in colonne_valuta:
             try:
                 n = float(str(val).replace(",", "."))
-                val = f"€ {n:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+                val = "€ {:.2f}".format(n).replace(",", "X").replace(".", ",").replace("X", ".")
             except (ValueError, TypeError):
                 pass
         return str(val)
@@ -88,69 +109,51 @@ def sostituisci_paragrafo(para, riga, colonne_valuta=None):
         for r in para.runs[1:]: r.text = ""
 
 def processa_documento(template_path, riga, colonne_valuta=None):
+    colonne_valuta = colonne_valuta or set()
     doc = Document(template_path)
-    for para in doc.paragraphs: sostituisci_paragrafo(para, riga, colonne_valuta)
+
+    # 1. Paragrafi normali
+    for para in doc.paragraphs:
+        sostituisci_paragrafo(para, riga, colonne_valuta)
+
+    # 2. Tabelle
     for tab in doc.tables:
         for row in tab.rows:
             for cell in row.cells:
-                for para in cell.paragraphs: sostituisci_paragrafo(para, riga, colonne_valuta)
+                for para in cell.paragraphs:
+                    sostituisci_paragrafo(para, riga, colonne_valuta)
+
+    # 3. Header e footer di ogni sezione
     for sez in doc.sections:
-        for para in sez.header.paragraphs: sostituisci_paragrafo(para, riga, colonne_valuta)
-        for para in sez.footer.paragraphs: sostituisci_paragrafo(para, riga, colonne_valuta)
+        for para in sez.header.paragraphs:
+            sostituisci_paragrafo(para, riga, colonne_valuta)
+        for para in sez.footer.paragraphs:
+            sostituisci_paragrafo(para, riga, colonne_valuta)
         if sez.different_first_page_header_footer:
-            for para in sez.first_page_header.paragraphs: sostituisci_paragrafo(para, riga, colonne_valuta)
-            for para in sez.first_page_footer.paragraphs: sostituisci_paragrafo(para, riga, colonne_valuta)
+            for para in sez.first_page_header.paragraphs:
+                sostituisci_paragrafo(para, riga, colonne_valuta)
+            for para in sez.first_page_footer.paragraphs:
+                sostituisci_paragrafo(para, riga, colonne_valuta)
+
+    # 4. Indice / TOC / Content Controls / campi strutturati
+    #    Agisce direttamente sull'XML del body per raggiungere
+    #    nodi non esposti da python-docx
+    sostituisci_xml_raw(doc.element.body, riga, colonne_valuta)
+
+    # 5. XML di header e footer (per sicurezza)
+    for sez in doc.sections:
+        sostituisci_xml_raw(sez.header._element, riga, colonne_valuta)
+        sostituisci_xml_raw(sez.footer._element, riga, colonne_valuta)
+        if sez.different_first_page_header_footer:
+            sostituisci_xml_raw(sez.first_page_header._element, riga, colonne_valuta)
+            sostituisci_xml_raw(sez.first_page_footer._element, riga, colonne_valuta)
+
     return doc
 
-# Profilo ICC sRGB di Windows — usato per OutputIntents PDF/A
-_SRGB_ICC = r"C:\Windows\System32\spool\drivers\color\sRGB Color Space Profile.icm"
-
-def _applica_pdfa(pdf_path):
-    """Aggiunge i marcatori PDF/A-2b (XMP + OutputIntents) a un PDF esistente."""
-    import pikepdf
-    from pikepdf import Dictionary, Array, Name
-
-    tmp = pdf_path + ".pdfa_tmp"
-    with pikepdf.open(pdf_path) as pdf:
-        with pdf.open_metadata() as meta:
-            meta["pdfaid:part"]        = "2"
-            meta["pdfaid:conformance"] = "B"
-
-        if os.path.exists(_SRGB_ICC):
-            with open(_SRGB_ICC, "rb") as f:
-                icc_data = f.read()
-            icc_stream = pdf.make_stream(icc_data)
-            icc_stream["/N"]         = pikepdf.Object.parse(b"3")
-            icc_stream["/Alternate"] = Name("/DeviceRGB")
-            icc_ref = pdf.make_indirect(icc_stream)
-            output_intent = Dictionary(
-                Type=Name("/OutputIntent"),
-                S=Name("/GTS_PDFA1"),
-                OutputConditionIdentifier=pikepdf.String("sRGB"),
-                DestOutputProfile=icc_ref,
-            )
-            if "/OutputIntents" not in pdf.Root:
-                pdf.Root["/OutputIntents"] = Array([output_intent])
-
-        pdf.save(tmp)
-    os.replace(tmp, pdf_path)
-
 def converti(docx_path, output_dir, soffice, fmt):
-    env = os.environ.copy()
-    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
-        meipass = sys._MEIPASS
-        paths = env.get("PATH", "").split(os.pathsep)
-        env["PATH"] = os.pathsep.join(p for p in paths if meipass not in p)
-    subprocess.run(
-        [soffice, "--headless", "--norestore", "--nologo",
-         "--convert-to", "pdf", "--outdir", output_dir, docx_path],
-        check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        timeout=300, env=env,
-    )
-    if fmt == "pdfa":
-        base     = os.path.splitext(os.path.basename(docx_path))[0]
-        pdf_path = os.path.join(output_dir, base + ".pdf")
-        _applica_pdfa(pdf_path)
+    filtro = "pdf:writer_pdf_Export:EmbedStandardFonts=true,SelectPdfVersion=1" if fmt == "pdfa" else "pdf"
+    subprocess.run([soffice, "--headless", "--convert-to", filtro, "--outdir", output_dir, docx_path],
+                   check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 # ── Finestra selezione record ─────────────────────────────────────────────────
 class DialogSelezioneRecord(tk.Toplevel):
